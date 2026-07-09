@@ -60,16 +60,20 @@ func (v *ShadowsocksServerConfig) Build() (proto.Message, error) {
 
 	if v.Users != nil {
 		for _, user := range v.Users {
+			cipher := user.Cipher
+			if cipher == "" {
+				cipher = v.Cipher
+			}
 			account := &shadowsocks.Account{
 				Password:   user.Password,
-				CipherType: cipherFromString(user.Cipher),
+				CipherType: cipherFromString(cipher),
 			}
 			if account.Password == "" {
 				return nil, errors.New("Shadowsocks password is not specified.")
 			}
 			if account.CipherType < shadowsocks.CipherType_AES_128_GCM ||
 				account.CipherType > shadowsocks.CipherType_XCHACHA20_POLY1305 {
-				return nil, errors.New("unsupported cipher method: ", user.Cipher)
+				return nil, errors.New("unsupported cipher method: ", cipher)
 			}
 			config.Users = append(config.Users, &protocol.User{
 				Email:   user.Email,
