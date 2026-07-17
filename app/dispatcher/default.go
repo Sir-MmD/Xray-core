@@ -13,6 +13,7 @@ import (
 	"github.com/xtls/xray-core/common/net"
 	"github.com/xtls/xray-core/common/protocol"
 	"github.com/xtls/xray-core/common/session"
+	"github.com/xtls/xray-core/common/speedlimit"
 	"github.com/xtls/xray-core/core"
 	"github.com/xtls/xray-core/features/dns"
 	"github.com/xtls/xray-core/features/outbound"
@@ -184,6 +185,14 @@ func (d *DefaultDispatcher) getLink(ctx context.Context) (*transport.Link, *tran
 		}
 	}
 
+	// Speed limiting is keyed by account email, so one bucket covers every
+	// connection an account has open. It is looked up outside the block above
+	// because it must also fire when the email is empty: see LookupSession.
+	if l := speedlimit.LookupSession(user, sessionInbound); l != nil {
+		inboundLink.Writer = speedlimit.NewWriter(ctx, inboundLink.Writer, l.Up)
+		outboundLink.Writer = speedlimit.NewWriter(ctx, outboundLink.Writer, l.Down)
+	}
+
 	return inboundLink, outboundLink
 }
 
@@ -192,6 +201,16 @@ func WrapLink(ctx context.Context, policyManager policy.Manager, statsManager st
 	var user *protocol.MemoryUser
 	if sessionInbound != nil {
 		user = sessionInbound.User
+	}
+
+	// Same lookup as getLink, but this seam is asymmetric: link.Reader carries the
+	// client's upload and link.Writer its download, so a paced Reader is needed as
+	// well as a paced Writer. Wrap before the TimeoutWrapperReader below, which
+	// must stay outermost because the stats block type-asserts it, and so does
+	// DispatchLink before sniffing.
+	if l := speedlimit.LookupSession(user, sessionInbound); l != nil {
+		link.Reader = speedlimit.NewReader(ctx, link.Reader, l.Up)
+		link.Writer = speedlimit.NewWriter(ctx, link.Writer, l.Down)
 	}
 
 	link.Reader = &buf.TimeoutWrapperReader{Reader: link.Reader}
