@@ -287,6 +287,14 @@ func (d *DefaultDispatcher) Dispatch(ctx context.Context, destination net.Destin
 	if !destination.IsValid() {
 		panic("Dispatcher: Invalid destination.")
 	}
+	// Refuse an account that is over its IP limit before anything is allocated.
+	// Both dispatcher entry points are gated: this one carries vmess, trojan,
+	// shadowsocks and every mux sub-stream, DispatchLink the rest. The returned
+	// ctx carries this connection's eviction token for the speedlimit wrappers.
+	ctx, err := speedlimit.Admit(ctx)
+	if err != nil {
+		return nil, err
+	}
 	outbounds := session.OutboundsFromContext(ctx)
 	if len(outbounds) == 0 {
 		outbounds = []*session.Outbound{{}}
@@ -343,6 +351,10 @@ func (d *DefaultDispatcher) Dispatch(ctx context.Context, destination net.Destin
 func (d *DefaultDispatcher) DispatchLink(ctx context.Context, destination net.Destination, outbound *transport.Link) error {
 	if !destination.IsValid() {
 		return errors.New("Dispatcher: Invalid destination.")
+	}
+	ctx, err := speedlimit.Admit(ctx)
+	if err != nil {
+		return err
 	}
 	outbounds := session.OutboundsFromContext(ctx)
 	if len(outbounds) == 0 {

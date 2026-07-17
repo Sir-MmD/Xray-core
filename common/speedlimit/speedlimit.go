@@ -1,7 +1,13 @@
-// Package speedlimit implements per-account bandwidth shaping for the dispatcher.
+// Package speedlimit implements per-account bandwidth shaping and per-account
+// concurrent source-IP limiting for the dispatcher.
+//
+// The two features share this package because they share everything that is
+// expensive: the sidecar file, its hot reload, the email resolution, and the
+// per-account object. Only the enforcement differs, so splitting them would
+// duplicate all of that to separate forty lines of admission control.
 //
 // This is a fork addition, not part of upstream Xray, so it is built to be cheap
-// to rebase: one self-contained package plus two small edits in
+// to rebase: one self-contained package plus a handful of lines in
 // app/dispatcher/default.go.
 //
 // Limits arrive out of band, through a JSON sidecar file named by the
@@ -57,16 +63,32 @@ const (
 	maxBurst = 1 << 30
 )
 
-// Limits holds one account's two independent token buckets.
+// Limits is one account's enforcement state: its two token buckets and its
+// concurrent source-IP tally.
 //
 // The directions are separate limiters on purpose: a single shared bucket can
 // only express a combined up+down ceiling, never "5 Mbit down, 2 Mbit up". Both
 // fields are non-nil for any account present in the sidecar. An unlimited
 // direction is rate.Inf rather than a nil limiter, so that a reload can re-rate
 // it in place for connections already holding a reference.
+//
+// The IP state hangs off the same object for the same reason: a reload reuses
+// the *Limits, so K changes in place and the live refcounts survive it. Its
+// mutex is never held together with the table's, so the two cannot deadlock.
 type Limits struct {
 	Up   *rate.Limiter
 	Down *rate.Limiter
+
+	ipMu sync.Mutex
+	// ipLimit is K, the cap on concurrent distinct source IPs. 0 is unlimited.
+	ipLimit int
+	// evictOldest is the "accept" strategy: at K, a new address takes the oldest
+	// address's slot instead of being refused. False is "reject".
+	evictOldest bool
+	// ips holds the LIVE dispatches per source address, so an address frees the
+	// instant its last connection ends. It is nil until the account first admits
+	// something under a limit.
+	ips map[netip.Addr]*ipEntry
 }
 
 // sidecarFile is the on-disk format. Rates are BYTES per second; 0 means that
@@ -76,11 +98,23 @@ type sidecarFile struct {
 	Users []sidecarUser `json:"users"`
 }
 
+// sidecarUser mirrors one entry of the file. Every field is optional: a document
+// written before ipLimit existed still parses, and its accounts come out
+// IP-unlimited, which is what they were.
+//
+// Strategy is what to do at K: "accept" evicts the account's oldest address,
+// anything else refuses the new one. It is not validated, because there is no
+// safe way to fail here: rejecting the document over one unrecognised word would
+// freeze EVERY account's limits at their last good value, so an unknown strategy
+// falls back to "reject", which is both the stricter reading and what an absent
+// field has always meant.
 type sidecarUser struct {
-	Email   string   `json:"email"`
-	DownBps int64    `json:"downBps"`
-	UpBps   int64    `json:"upBps"`
-	IPs     []string `json:"ips"`
+	Email    string   `json:"email"`
+	DownBps  int64    `json:"downBps"`
+	UpBps    int64    `json:"upBps"`
+	IPLimit  int      `json:"ipLimit"`
+	Strategy string   `json:"strategy"`
+	IPs      []string `json:"ips"`
 }
 
 // index is an immutable snapshot. It is replaced wholesale on reload, but the
@@ -152,6 +186,10 @@ func LookupSession(user *protocol.MemoryUser, inbound *session.Inbound) *Limits 
 	if defaultTable == nil {
 		return nil
 	}
+	return defaultTable.lookupSession(user, inbound)
+}
+
+func (t *table) lookupSession(user *protocol.MemoryUser, inbound *session.Inbound) *Limits {
 	var email string
 	if user != nil {
 		email = user.Email
@@ -161,7 +199,7 @@ func LookupSession(user *protocol.MemoryUser, inbound *session.Inbound) *Limits 
 	if email == "" && inbound != nil && inbound.Source.Address != nil && inbound.Source.Address.Family().IsIP() {
 		ip = inbound.Source.Address.IP()
 	}
-	return defaultTable.lookup(email, ip)
+	return t.lookup(email, ip)
 }
 
 func (t *table) lookup(email string, ip net.IP) *Limits {
@@ -330,6 +368,9 @@ func buildIndex(prev *index, f *sidecarFile) (*index, error) {
 			setRate(l.Up, u.UpBps)
 			setRate(l.Down, u.DownBps)
 		}
+		// Reusing the *Limits is what makes K change in place: the live refcounts
+		// are on it, so lowering K cannot disturb connections already admitted.
+		l.setIPLimit(u.IPLimit, u.Strategy)
 		idx.byEmail[u.Email] = l
 
 		for _, pfx := range p.prefixes {
@@ -354,6 +395,10 @@ func buildIndex(prev *index, f *sidecarFile) (*index, error) {
 			if _, ok := idx.byEmail[email]; !ok {
 				setRate(l.Up, 0)
 				setRate(l.Down, 0)
+				// The IP tally needs no such rescue. It is only ever reached through
+				// the index, which no longer holds this account, so admission can
+				// never consult it again; the limiters are different because an open
+				// connection captured them in its io wrappers at dispatch time.
 			}
 		}
 	}
