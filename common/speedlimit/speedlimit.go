@@ -189,6 +189,28 @@ func LookupSession(user *protocol.MemoryUser, inbound *session.Inbound) *Limits 
 	return defaultTable.lookupSession(user, inbound)
 }
 
+// DisableSplice marks a session as ineligible for the zero-copy splice path.
+//
+// It MUST be called for every session the limiter is applied to. Pacing lives in the
+// buf.Reader/buf.Writer wrappers the dispatcher installs, and the splice path
+// (proxy.CopyRawConnIfExist) hands the two raw TCP sockets to tc.ReadFrom instead,
+// moving bytes kernel-to-kernel WITHOUT ever touching those wrappers. A spliced
+// connection is therefore completely unlimited, silently.
+//
+// This is not a corner case: dokodemo-door sets CanSpliceCopy=1 and freedom sets it on
+// the outbound, which is exactly the shape every VPN tunnel protocol here arrives in
+// (l2tp/pptp/openvpn/openconnect/sstp/ikev2/wg-c/awg all enter through dokodemo and
+// egress through freedom), so before this the limiter did nothing at all for them
+// while working normally for vmess/vless/trojan (which must decrypt and so never splice).
+//
+// 3 is the "cannot splice" state CopyRawConnIfExist checks first. Only limited accounts
+// pay the buffered-copy cost; unlimited ones keep the fast path.
+func DisableSplice(inbound *session.Inbound) {
+	if inbound != nil {
+		inbound.CanSpliceCopy = 3
+	}
+}
+
 func (t *table) lookupSession(user *protocol.MemoryUser, inbound *session.Inbound) *Limits {
 	var email string
 	if user != nil {

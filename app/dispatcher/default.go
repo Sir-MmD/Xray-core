@@ -189,6 +189,7 @@ func (d *DefaultDispatcher) getLink(ctx context.Context) (*transport.Link, *tran
 	// connection an account has open. It is looked up outside the block above
 	// because it must also fire when the email is empty: see LookupSession.
 	if l := speedlimit.LookupSession(user, sessionInbound); l != nil {
+		speedlimit.DisableSplice(sessionInbound)
 		inboundLink.Writer = speedlimit.NewWriter(ctx, inboundLink.Writer, l.Up)
 		outboundLink.Writer = speedlimit.NewWriter(ctx, outboundLink.Writer, l.Down)
 	}
@@ -209,6 +210,7 @@ func WrapLink(ctx context.Context, policyManager policy.Manager, statsManager st
 	// must stay outermost because the stats block type-asserts it, and so does
 	// DispatchLink before sniffing.
 	if l := speedlimit.LookupSession(user, sessionInbound); l != nil {
+		speedlimit.DisableSplice(sessionInbound)
 		link.Reader = speedlimit.NewReader(ctx, link.Reader, l.Up)
 		link.Writer = speedlimit.NewWriter(ctx, link.Writer, l.Down)
 	}
